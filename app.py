@@ -116,7 +116,7 @@ st.markdown(
     f"""
 <style>
   @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
-
+  
   html, body, [class*="css"] {{
       font-family: 'IBM Plex Sans', sans-serif;
       background-color: {C['bg']};
@@ -130,6 +130,7 @@ footer {{ visibility: hidden; }}
   section[data-testid="stSidebar"] {{
       background-color: {C['surface']};
       border-right: 1px solid {C['border']};
+      
   }}
   section[data-testid="stSidebar"] .stMarkdown p {{ color: {C['muted']}; }}
 
@@ -433,114 +434,78 @@ def build_pipeline(df_hash: int, df: pd.DataFrame, target_col: str):
     """
     _empty = (None,) * 8
 
+    # 1. Classify columns and clean data
     num_cols, cat_cols, feat_cols = classify_columns(df, target_col)
     if not feat_cols:
         return _empty
 
     work = df[feat_cols + [target_col]].copy()
 
-    # ── Missing value imputation ──────────────────────────────────────────────
-    if num_cols:
-        num_imp = SimpleImputer(strategy="median")
-        work[num_cols] = num_imp.fit_transform(work[num_cols])
-
-    if cat_cols:
-        cat_imp = SimpleImputer(strategy="most_frequent")
-        work[cat_cols] = cat_imp.fit_transform(work[cat_cols])
-
-    # ── LabelEncode categorical features ─────────────────────────────────────
-    feat_encoders: dict = {}
+    # Impute missing values
+    for col in num_cols:
+        work[col] = work[col].fillna(work[col].median() if not pd.isna(work[col].median()) else 0)
     for col in cat_cols:
-        le = LabelEncoder()
-        work[col] = le.fit_transform(work[col].astype(str))
-        feat_encoders[col] = le
+        work[col] = work[col].fillna(work[col].mode()[0] if not work[col].mode().empty else "Unknown")
 
-    # ── Binarise target ───────────────────────────────────────────────────────
-    target_series = work[target_col].copy()
+    X = work[feat_cols].copy()
+    y = work[target_col].copy()
 
-    if pd.api.types.is_numeric_dtype(target_series):
-        unique_vals = sorted(target_series.dropna().unique())
-        if len(unique_vals) > 2:
-            top2 = (
-                target_series.value_counts()
-                              .head(2)
-                              .index.tolist()
-            )
-            work          = work[target_series.isin(top2)].copy()
-            target_series = work[target_col]
-        target_le = LabelEncoder()
-        y = target_le.fit_transform(target_series.astype(str))
+    # 2. Encode categorical features
+    feat_encoders = {}
+    for col in cat_cols:
+        from sklearn.preprocessing import LabelEncoder
+        le_f = LabelEncoder()
+        X[col] = le_f.fit_transform(X[col].astype(str))
+        feat_encoders[col] = le_f
+
+    # 3. 🔥 Auto-Detect Task: Regression vs Classification
+    import numpy as np
+    from sklearn.ensemble import GradientBoostingClassifier, GradientBoostingRegressor
+    from sklearn.preprocessing import LabelEncoder
+    from sklearn.model_selection import train_test_split
+
+    is_regression = y.dtype in [np.float64, np.float32] or y.nunique() > (len(y) * 0.4)
+    target_le = None
+
+    if is_regression:
+        # For continuous targets like Strike Rate
+        y = y.fillna(y.mean() if not pd.isna(y.mean()) else 0)
+        X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.20, random_state=42)
+        clf = GradientBoostingRegressor(n_estimators=50, random_state=42, min_samples_split=2)
     else:
+        # For discrete classes
+        y = y.fillna(y.mode()[0] if not y.mode().empty else 0)
         target_le = LabelEncoder()
-        y_enc     = target_le.fit_transform(target_series.astype(str))
-        if len(target_le.classes_) > 2:
-            top2 = (
-                target_series.value_counts()
-                              .head(2)
-                              .index.tolist()
-            )
-            work  = work[target_series.isin(top2)].copy()
-            y_enc = target_le.fit_transform(work[target_col].astype(str))
-        y = y_enc
+        y = target_le.fit_transform(y.astype(str))
+        X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.20, random_state=42)
+        clf = GradientBoostingClassifier(n_estimators=50, random_state=42, min_samples_split=2)
 
-    if len(np.unique(y)) < 2:
-        return _empty
-
-    X = work[feat_cols].values
-
-    # ── Train / test split ────────────────────────────────────────────────────
-    X_tr, X_te, y_tr, y_te = train_test_split(
-        X, y, test_size=0.20, random_state=42
-    )
-
-    # ── GradientBoostingClassifier ────────────────────────────────────────────
-    clf = GradientBoostingClassifier(
-        n_estimators=200,
-        max_depth=4,
-        learning_rate=0.07,
-        subsample=0.85,
-        min_samples_leaf=20,
-        random_state=42,
-        n_iter_no_change=12,
-        tol=1e-3,
-    )
+    # 4. Train the Model
     clf.fit(X_tr, y_tr)
 
-    # ── Evaluation metrics ────────────────────────────────────────────────────
-    y_pred  = clf.predict(X_te)
-    y_proba = clf.predict_proba(X_te)[:, 1]
+    # 5. Build Metrics for App Compatibility
+    model_metrics = {"Train Score": float(clf.score(X_tr, y_tr)), "Test Score": float(clf.score(X_te, y_te))}
+    importances = list(clf.feature_importances_) if hasattr(clf, "feature_importances_") else [0] * len(feat_cols)
 
-    metrics = {
-        "accuracy":  accuracy_score(y_te, y_pred),
-        "precision": precision_score(y_te, y_pred, zero_division=0),
-        "recall":    recall_score(y_te, y_pred, zero_division=0),
-        "f1":        f1_score(y_te, y_pred, zero_division=0),
-        "roc_auc":   roc_auc_score(y_te, y_proba),
-    }
-
-    # ── Feature importances ───────────────────────────────────────────────────
-    importances = (
-        pd.Series(clf.feature_importances_, index=feat_cols)
-          .sort_values(ascending=True)
-    )
-
-    # ── Per-column metadata for dynamic predictor form ────────────────────────
-    col_meta: dict = {}
+    # Per-column metadata for dynamic predictor form (Dashboard feature retained)
+    col_meta = {}
     for col in num_cols:
         if col in work.columns:
             col_meta[col] = {
                 "type": "numeric",
-                "min":  float(work[col].min()),
-                "max":  float(work[col].max()),
+                "min": float(work[col].min()),
+                "max": float(work[col].max()),
                 "mean": float(work[col].mean()),
             }
     for col in cat_cols:
         col_meta[col] = {
-            "type":    "categorical",
+            "type": "categorical",
             "classes": list(feat_encoders[col].classes_),
         }
 
-    return clf, feat_encoders, target_le, metrics, importances, feat_cols, col_meta, work
+    work_df = work.copy()
+
+    return clf, feat_encoders, target_le, model_metrics, importances, feat_cols, col_meta, work_df
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -961,12 +926,11 @@ with tab2:
     # ── Model performance banner ──────────────────────────────────────────────
     target_classes = target_le.classes_ if target_le is not None else ["0", "1"]
 
-    st.markdown(
-        f"""
+    if 'accuracy' in model_metrics:
+        st.markdown(f"""
         <div class="metric-band">
             <div style="font-size:0.82rem; color:{C['muted']}; margin-right:4px;">
-                GradientBoostingClassifier &nbsp;·&nbsp;
-                Classes:&nbsp;
+                GradientBoostingClassifier &nbsp;&middot;&nbsp; Classes:&nbsp;
                 <code style="color:{C['primary']};">{list(target_classes)}</code>
             </div>
             <div class="metric-pill">
@@ -985,9 +949,21 @@ with tab2:
                 AUC-ROC <span>{model_metrics['roc_auc']:.1%}</span>
             </div>
         </div>
-        """,
-        unsafe_allow_html=True,
-    )
+        """, unsafe_allow_html=True)
+    else:
+        st.markdown(f"""
+        <div class="metric-band">
+            <div style="font-size:0.82rem; color:{C['muted']}; margin-right:4px;">
+                GradientBoostingRegressor &nbsp;&middot;&nbsp; Continuous Target
+            </div>
+            <div class="metric-pill">
+                Train Score (R²) <span>{model_metrics['Train Score']:.2f}</span>
+            </div>
+            <div class="metric-pill">
+                Test Score (R²) <span>{model_metrics['Test Score']:.2f}</span>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
 
     ml_left, ml_right = st.columns([2, 3])
 
@@ -1188,8 +1164,11 @@ with tab2:
             'Feature Importance (Gini Impurity)</div>',
             unsafe_allow_html=True,
         )
-        imp_df = importances.reset_index()
-        imp_df.columns = ["feature", "importance"]
+        if isinstance(importances, list):
+            imp_df = pd.DataFrame({"feature": feat_cols, "importance": importances})
+        else:
+            imp_df = importances.reset_index()
+            imp_df.columns = ["feature", "importance"]
 
         fig_imp = go.Figure(go.Bar(
             x=imp_df["importance"],
