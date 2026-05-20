@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.ensemble import GradientBoostingClassifier, GradientBoostingRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import (
     accuracy_score,
@@ -468,23 +468,36 @@ def build_pipeline(df_hash: int, df: pd.DataFrame, target_col: str):
     target_le = None
 
     if is_regression:
-        # For continuous targets like Strike Rate
         y = y.fillna(y.mean() if not pd.isna(y.mean()) else 0)
         X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.20, random_state=42)
         clf = GradientBoostingRegressor(n_estimators=50, random_state=42, min_samples_split=2)
+
+        clf.fit(X_tr, y_tr)
+
+        model_metrics = {
+            "Train Score": float(clf.score(X_tr, y_tr)),
+            "Test Score": float(clf.score(X_te, y_te))
+        }
     else:
-        # For discrete classes
         y = y.fillna(y.mode()[0] if not y.mode().empty else 0)
         target_le = LabelEncoder()
         y = target_le.fit_transform(y.astype(str))
         X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.20, random_state=42)
         clf = GradientBoostingClassifier(n_estimators=50, random_state=42, min_samples_split=2)
 
-    # 4. Train the Model
-    clf.fit(X_tr, y_tr)
+        clf.fit(X_tr, y_tr)
 
-    # 5. Build Metrics for App Compatibility
-    model_metrics = {"Train Score": float(clf.score(X_tr, y_tr)), "Test Score": float(clf.score(X_te, y_te))}
+        y_pred_te = clf.predict(X_te)
+
+        model_metrics = {
+            "accuracy": float(accuracy_score(y_te, y_pred_te)),
+            "precision": float(precision_score(y_te, y_pred_te, average='weighted', zero_division=0)),
+            "recall": float(recall_score(y_te, y_pred_te, average='weighted')),
+            "f1": float(f1_score(y_te, y_pred_te, average='weighted')),
+            "roc_auc": 0.0,
+            "Train Score": float(clf.score(X_tr, y_tr)),
+            "Test Score": float(clf.score(X_te, y_te))
+        }
     importances = list(clf.feature_importances_) if hasattr(clf, "feature_importances_") else [0] * len(feat_cols)
 
     # Per-column metadata for dynamic predictor form (Dashboard feature retained)
@@ -1055,91 +1068,89 @@ with tab2:
                         row[feat] = 0.0
 
             X_input = pd.DataFrame([row])[feat_cols]
-            prob    = clf.predict_proba(X_input)[0, 1]
-            label   = clf.predict(X_input)[0]
 
-            # Map numeric label back to original class string
-            if target_le is not None:
-                label_str = str(target_le.inverse_transform([label])[0])
-                pos_class = str(target_le.classes_[-1])
+            if isinstance(clf, GradientBoostingRegressor):
+                pred_val = clf.predict(X_input)[0]
+                outcome = f"📊 Predicted Value — {pred_val:.2f}"
+                advice = f"The model predicts the continuous outcome to be approximately {pred_val:.2f} units."
+                result_cls = "pred-low"
+                prob_display = f"{pred_val:.1f}"
+                sub_note = "Predicted Regression Value"
+                color = C["success"]
             else:
-                label_str = str(label)
-                pos_class = "1"
+                prob = clf.predict_proba(X_input)[0, 1]
+                label = clf.predict(X_input)[0]
 
-            is_high    = prob >= (risk_threshold / 100)
-            color      = C["danger"] if is_high else C["success"]
-            result_cls = "pred-high" if is_high else "pred-low"
-            outcome    = (
-                f"⚠️  HIGH RISK — {label_str}"
-                if is_high else
-                f"✅  LOW RISK — {label_str}"
-            )
-            advice = (
-                "Predicted positive / high-risk class. "
-                "Consider targeted intervention or review."
-                if is_high else
-                "Predicted negative / low-risk class. "
-                "No immediate action required."
-            )
+                if target_le is not None:
+                    label_str = str(target_le.inverse_transform([label])[0])
+                    pos_class = str(target_le.classes_[-1])
+                else:
+                    label_str = str(label)
+                    pos_class = "1"
+
+                is_high = prob >= (risk_threshold / 100)
+                color = C["danger"] if is_high else C["success"]
+                result_cls = "pred-high" if is_high else "pred-low"
+                outcome = f"⚠️ HIGH RISK — {label_str}" if is_high else f"✅ LOW RISK — {label_str}"
+                advice = "Predicted positive / high-risk class. Consider targeted intervention or review." if is_high else "Predicted negative / low-risk class. No immediate action required."
+                prob_display = f"{prob:.1%}"
+                sub_note = f"Probability of positive class ({pos_class})"
 
             st.markdown(
                 f"""
-                <div class="{result_cls}">
-                    <div class="pred-title" style="color:{color};">{outcome}</div>
-                    <div class="pred-pct"   style="color:{color};">{prob:.1%}</div>
-                    <div class="pred-note">
-                        Probability of positive class
-                        (<code style="color:{C['muted']};">{pos_class}</code>)
-                    </div>
-                    <div style="margin-top:10px; font-size:0.82rem;
-                                color:{C['muted']};">{advice}</div>
-                </div>
-                """,
+                            <div class="{result_cls}">
+                                <div class="pred-title" style="color:{color};">{outcome}</div>
+                                <div class="pred-pct"   style="color:{color};">{prob_display}</div>
+                                <div class="pred-note">{sub_note}</div>
+                                <div style="margin-top:10px; font-size:0.82rem; color:{C['muted']};">{advice}</div>
+                            </div>
+                            """,
                 unsafe_allow_html=True,
             )
 
             st.markdown("<br>", unsafe_allow_html=True)
 
             # Probability gauge
-            fig_gauge = go.Figure(go.Indicator(
-                mode="gauge+number+delta",
-                value=prob * 100,
-                delta={
-                    "reference":   risk_threshold,
-                    "valueformat": ".1f",
-                    "suffix":      "%",
-                    "increasing":  {"color": C["danger"]},
-                    "decreasing":  {"color": C["success"]},
-                },
-                number={"suffix": "%", "font": {"size": 38, "color": C["text"]}},
-                gauge={
-                    "axis": {
-                        "range": [0, 100],
-                        "ticksuffix": "%",
-                        "tickfont":   {"color": C["muted"]},
+            if type(clf).__name__ != "GradientBoostingRegressor":
+                fig_gauge = go.Figure(go.Indicator(
+                    mode="gauge+number+delta",
+                    value=prob * 100,
+                    delta={
+                        "reference": risk_threshold,
+                        "valueformat": ".1f",
+                        "suffix": "%",
+                        "increasing": {"color": C["danger"]},
+                        "decreasing": {"color": C["success"]},
                     },
-                    "bar":         {"color": color},
-                    "bgcolor":     C["surface"],
-                    "bordercolor": C["border"],
-                    "steps": [
-                        {
-                            "range": [0, risk_threshold],
-                            "color": "rgba(52,211,153,0.10)",
+                    number={"suffix": "%", "font": {"size": 38, "color": C["text"]}},
+                    gauge={
+                        "axis": {
+                            "range": [0, 100],
+                            "ticksuffix": "%",
+                            "tickfont": {"color": C["muted"]},
                         },
-                        {
-                            "range": [risk_threshold, 100],
-                            "color": "rgba(248,113,113,0.12)",
+                        "bar": {"color": color},
+                        "bgcolor": C["surface"],
+                        "bordercolor": C["border"],
+                        "steps": [
+                            {
+                                "range": [0, risk_threshold],
+                                "color": "rgba(52,211,153,0.10)",
+                            },
+                            {
+                                "range": [risk_threshold, 100],
+                                "color": "rgba(248,113,113,0.12)",
+                            },
+                        ],
+                        "threshold": {
+                            "line": {"color": C["accent"], "width": 2},
+                            "thickness": 0.75,
+                            "value": risk_threshold,
                         },
-                    ],
-                    "threshold": {
-                        "line":      {"color": C["accent"], "width": 2},
-                        "thickness": 0.75,
-                        "value":     risk_threshold,
                     },
-                },
-            ))
-            themed(fig_gauge, "Positive-Class Probability", height=270)
-            st.plotly_chart(fig_gauge, use_container_width=True)
+                ))
+                themed(fig_gauge, "Positive-Class Probability", height=270)
+                st.plotly_chart(fig_gauge, use_container_width=True)
 
         else:
             st.markdown(
@@ -1498,7 +1509,10 @@ with tab3:
 perf_line = "Universal ML Engine Active"
 if 'model_ready' in globals() and model_ready:
     if 'model_metrics' in globals() and model_metrics is not None:
-        perf_line = f"GradientBoostingClassifier &nbsp;·&nbsp; AUC-ROC: {model_metrics.get('roc_auc', 0.0):.3f} &nbsp;·&nbsp; Accuracy: {model_metrics.get('accuracy', 0.0):.3f}"
+        if 'accuracy' in model_metrics:
+            perf_line = f"GradientBoostingClassifier &nbsp;·&nbsp; AUC-ROC: {model_metrics.get('roc_auc', 0.0):.3f} &nbsp;·&nbsp; Accuracy: {model_metrics.get('accuracy', 0.0):.3f}"
+        elif 'Test Score' in model_metrics:
+            perf_line = f"GradientBoostingRegressor &nbsp;·&nbsp; Train R²: {model_metrics.get('Train Score', 0.0):.3f} &nbsp;·&nbsp; Test R²: {model_metrics.get('Test Score', 0.0):.3f}"
 
 st.markdown(
     f"""
